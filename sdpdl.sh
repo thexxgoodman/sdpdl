@@ -7,6 +7,13 @@
 
 set -eo pipefail
 
+# ── Telegram-уведомление (опционально) ───────────────────────────────────────
+# Заполни TG_BOT_TOKEN и TG_CHAT_ID — и уведомление будет отправлено.
+# Оставь пустыми — ничего не произойдёт, ошибок не будет.
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+# ─────────────────────────────────────────────────────────────────────────────
+
 echo "=== [0] Detect workspace and project dir ==="
 WORKSPACE="${WORKSPACE:-/workspace}"
 PROJECT_DIR="$WORKSPACE/PandoraPDL"
@@ -28,19 +35,15 @@ else
 fi
 
 echo "=== [2] Init conda in bash ==="
-# Подключаем conda к текущей shell
 eval "$(/opt/miniconda3/bin/conda shell.bash hook)"
 
 echo "=== [2.1] Accept Anaconda Terms of Service for defaults (non-interactive) ==="
-# Новые Miniconda/conda требуют явного принятия ToS для каналов Anaconda.
-# На старых версиях 'conda tos' может не существовать — поэтому временно отключаем set -e.
 set +e
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 set -e
 
 echo "=== [2.2] Create envs 'sadtalker' (py3.10) and 'pandorapdl' (py3.12) ==="
-# Создаём окружение 'sadtalker', если его ещё нет
 if ! conda env list | grep -qE '^sadtalker[[:space:]]'; then
   echo "Creating conda env 'sadtalker' with python=3.10..."
   conda create -y -n sadtalker python=3.10
@@ -48,7 +51,6 @@ else
   echo "Conda env 'sadtalker' already exists, skipping create."
 fi
 
-# Создаём окружение 'pandorapdl', если его ещё нет
 if ! conda env list | grep -qE '^pandorapdl[[:space:]]'; then
   echo "Creating conda env 'pandorapdl' with python=3.12..."
   conda create -y -n pandorapdl python=3.12
@@ -57,10 +59,7 @@ else
 fi
 
 echo "=== [2.3] Activate 'sadtalker' env for SadTalker setup ==="
-# Дальше вся установка SadTalker идёт в env 'sadtalker'
 conda activate sadtalker
-
-# Обновляем pip (по желанию можно убрать)
 python -m pip install --upgrade pip
 
 echo "=== [3] Ensure git + ffmpeg installed ==="
@@ -89,18 +88,24 @@ cd "$PROJECT_DIR/SadTalker"
 echo "=== [5] Install SadTalker requirements into conda env 'sadtalker' ==="
 pip install -r requirements.txt
 
+echo "=== [5.1] Fix pkg_resources (setuptools<70) ==="
+# setuptools>=70 убрал pkg_resources из публичного API — librosa на нём падает.
+# Ищем pip в venv или conda и принудительно ставим совместимую версию.
+for ST_PIP in /venv/sadtalker/bin/pip /opt/miniconda3/envs/sadtalker/bin/pip; do
+  if [ -x "$ST_PIP" ]; then
+    echo "Fixing setuptools via $ST_PIP ..."
+    "$ST_PIP" install "setuptools<70" --force-reinstall --quiet || true
+  fi
+done
+
 echo "=== [6] Download SadTalker models ==="
 bash scripts/download_models.sh
 
 echo "=== [7] Fix basicsr rgb_to_grayscale import ==="
-
-# Кандидатные пути под разные варианты установки basicsr
 CANDIDATES=(
   "/venv/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"
   "/opt/miniconda3/envs/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"
 )
-
-# Патчим всё, что реально существует
 for f in "${CANDIDATES[@]}"; do
   if [ -f "$f" ]; then
     echo "Patching $f ..."
@@ -111,15 +116,24 @@ for f in "${CANDIDATES[@]}"; do
 done
 
 echo "=== [8] Setup conda for future shells (without auto-activation) ==="
-# Добавляем только conda init в .bashrc root'а, без "conda activate ..."
 if ! grep -q "/opt/miniconda3/bin/conda" /root/.bashrc 2>/dev/null; then
   /opt/miniconda3/bin/conda init bash || true
 fi
 
-# Явно деактивируем окружение в конце скрипта
 conda deactivate || true
 
 echo "=== [DONE] Provisioning finished ==="
 echo "Project dir: $PROJECT_DIR"
 echo "SadTalker:   $PROJECT_DIR/SadTalker"
 echo "Envs:        sadtalker (py3.10), pandorapdl (py3.12)"
+
+# ── Telegram-уведомление ──────────────────────────────────────────────────────
+# Отправляем только если оба значения заполнены. Ошибки игнорируем.
+if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+  INSTANCE_ID="${VAST_CONTAINERLABEL:-$(hostname)}"
+  TG_MSG="✅ Инстанс готов к работе%0A🖥 ID: ${INSTANCE_ID}%0A📁 ${PROJECT_DIR}"
+  curl -s --max-time 10 \
+    "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TG_CHAT_ID}&text=${TG_MSG}" \
+    > /dev/null 2>&1 || true
+fi
