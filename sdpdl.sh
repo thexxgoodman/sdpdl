@@ -8,6 +8,8 @@
 set -eo pipefail
 
 # ── Telegram-уведомление (опционально) ───────────────────────────────────────
+# Заполни TG_BOT_TOKEN и TG_CHAT_ID — уведомление придёт когда всё готово.
+# Оставь пустыми — ничего не произойдёт.
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,73 +81,127 @@ fi
 
 cd "$ECHOMIMIC_DIR"
 
-echo "=== [5] Install EchoMimic requirements into 'echomimic' env ==="
-conda activate echomimic
-python -m pip install --upgrade pip --quiet
+echo "=== [5] Install EchoMimic requirements ==="
 
-# PyTorch 2.5.1 + CUDA 12.4 (совместимо с драйвером 12.8 на Vast.ai)
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-    xformers==0.0.28.post3 \
-    --index-url https://download.pytorch.org/whl/cu124 --quiet
-
-# torchao для ускорения
-pip install torchao --index-url https://download.pytorch.org/whl/nightly/cu124 --quiet || \
-  echo "WARNING: torchao install failed — continuing without it"
-
-pip install -r requirements.txt --quiet
-pip install --no-deps facenet_pytorch --quiet || true
-pip install pyyaml --quiet
-
-echo "=== [5.1] Fix pkg_resources (setuptools<70) ==="
-for PIP_PATH in /venv/echomimic/bin/pip /opt/miniconda3/envs/echomimic/bin/pip; do
-  if [ -x "$PIP_PATH" ]; then
-    echo "Fixing setuptools via $PIP_PATH ..."
-    "$PIP_PATH" install "setuptools<70" --force-reinstall --quiet || true
+# Находим pip для echomimic env (может быть в /venv или /opt/miniconda3/envs)
+EM_PIP=""
+for p in /venv/echomimic/bin/pip /opt/miniconda3/envs/echomimic/bin/pip; do
+  if [ -x "$p" ]; then
+    EM_PIP="$p"
+    break
   fi
 done
 
+if [ -z "$EM_PIP" ]; then
+  echo "ERROR: pip for echomimic env not found!" >&2
+  exit 1
+fi
+
+echo "Using pip: $EM_PIP"
+
+# Обновляем pip
+"$EM_PIP" install --upgrade pip --quiet
+
+# ВАЖНО: сначала фиксим setuptools глобально И в env —
+# pip создаёт изолированные /tmp envs при сборке пакетов,
+# и там тоже нужен setuptools<70
+echo "=== [5.1] Fix setuptools BEFORE anything else ==="
+pip install "setuptools<70" --force-reinstall --quiet || true
+"$EM_PIP" install "setuptools<70" --force-reinstall --quiet
+
+# Проверяем
+"$EM_PIP" python -c "import pkg_resources; print('pkg_resources OK')" 2>/dev/null || \
+  echo "WARNING: pkg_resources check failed, continuing anyway"
+
+# PyTorch 2.5.1 + CUDA 12.4 (совместимо с драйвером 12.8 на Vast.ai)
+echo "=== [5.2] Install PyTorch ==="
+"$EM_PIP" install \
+  torch==2.5.1 \
+  torchvision==0.20.1 \
+  torchaudio==2.5.1 \
+  xformers==0.0.28.post3 \
+  --index-url https://download.pytorch.org/whl/cu124 --quiet
+
+# torchao для ускорения (опционально)
+"$EM_PIP" install torchao \
+  --index-url https://download.pytorch.org/whl/nightly/cu124 --quiet || \
+  echo "WARNING: torchao install failed — continuing without it"
+
+# clip устанавливаем отдельно с --no-build-isolation
+# чтобы обойти проблему с pkg_resources в /tmp изоляции
+echo "=== [5.3] Install clip ==="
+"$EM_PIP" install \
+  "git+https://github.com/openai/CLIP.git" \
+  --no-build-isolation --quiet
+
+# Основные зависимости EchoMimic — тоже с --no-build-isolation
+echo "=== [5.4] Install EchoMimic requirements.txt ==="
+"$EM_PIP" install -r requirements.txt --no-build-isolation --quiet
+
+# Дополнительные пакеты
+"$EM_PIP" install --no-deps facenet_pytorch --quiet || true
+"$EM_PIP" install pyyaml --quiet
+
 echo "=== [6] Download EchoMimic pretrained weights ==="
-python - <<'PYEOF'
-import os, subprocess
-weights_dir = os.environ.get("ECHOMIMIC_DIR", "/workspace/PandoraPDL/EchoMimicV2") + "/pretrained_weights"
+EM_PYTHON=""
+for p in /venv/echomimic/bin/python /opt/miniconda3/envs/echomimic/bin/python; do
+  if [ -x "$p" ]; then
+    EM_PYTHON="$p"
+    break
+  fi
+done
+
+mkdir -p "$ECHOMIMIC_DIR/pretrained_weights/audio_processor"
+
+"$EM_PYTHON" - <<'PYEOF'
+import os, subprocess, sys
+
+echomimic_dir = os.environ.get("ECHOMIMIC_DIR", "/workspace/PandoraPDL/EchoMimicV2")
+weights_dir   = echomimic_dir + "/pretrained_weights"
 os.makedirs(weights_dir, exist_ok=True)
 
-files = [
-    ("BadToBest/EchoMimicV2", "denoising_unet_acc.pth"),
-    ("BadToBest/EchoMimicV2", "reference_unet.pth"),
-    ("BadToBest/EchoMimicV2", "motion_module_acc.pth"),
-    ("BadToBest/EchoMimicV2", "pose_encoder.pth"),
-]
-for repo, fname in files:
-    out = os.path.join(weights_dir, fname)
-    if not os.path.exists(out):
-        print(f"Downloading {fname}...")
-        subprocess.run(["huggingface-cli", "download", repo, fname,
-                        "--local-dir", weights_dir], check=False)
-    else:
-        print(f"Already exists: {fname}")
+# Ищем huggingface-cli рядом с текущим python
+python_bin = sys.executable
+hf_cli     = python_bin.replace("python", "huggingface-cli")
+if not os.path.exists(hf_cli):
+    hf_cli = "huggingface-cli"
 
+def dl(repo, fname, local_dir):
+    out = os.path.join(local_dir, fname)
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        print(f"  Already exists: {fname}")
+        return
+    print(f"  Downloading {fname} ...")
+    subprocess.run([hf_cli, "download", repo, fname,
+                    "--local-dir", local_dir], check=False)
+
+print("[6.1] EchoMimic V2 accelerated weights")
+for fname in ["denoising_unet_acc.pth", "reference_unet.pth",
+              "motion_module_acc.pth", "pose_encoder.pth"]:
+    dl("BadToBest/EchoMimicV2", fname, weights_dir)
+
+print("[6.2] VAE sd-vae-ft-mse")
 vae_dir = os.path.join(weights_dir, "sd-vae-ft-mse")
-if not os.path.isdir(vae_dir):
-    print("Downloading sd-vae-ft-mse VAE...")
-    subprocess.run(["huggingface-cli", "download", "stabilityai/sd-vae-ft-mse",
-                    "--local-dir", vae_dir], check=False)
+os.makedirs(vae_dir, exist_ok=True)
+subprocess.run([hf_cli, "download", "stabilityai/sd-vae-ft-mse",
+                "--local-dir", vae_dir], check=False)
 
+print("[6.3] Whisper tiny")
 audio_dir = os.path.join(weights_dir, "audio_processor")
 os.makedirs(audio_dir, exist_ok=True)
 whisper_path = os.path.join(audio_dir, "tiny.pt")
 if not os.path.exists(whisper_path):
-    print("Downloading whisper tiny...")
-    subprocess.run(["huggingface-cli", "download", "openai/whisper-tiny",
+    subprocess.run([hf_cli, "download", "openai/whisper-tiny",
                     "--local-dir", audio_dir], check=False)
-    pth = os.path.join(audio_dir, "pytorch_model.bin")
-    if os.path.exists(pth) and not os.path.exists(whisper_path):
-        os.rename(pth, whisper_path)
+    # Переименовываем если нужно
+    for candidate in ["pytorch_model.bin", "model.safetensors"]:
+        src = os.path.join(audio_dir, candidate)
+        if os.path.exists(src) and not os.path.exists(whisper_path):
+            os.rename(src, whisper_path)
+            break
 
 print("Weights download complete.")
 PYEOF
-
-conda deactivate || true
 
 echo "=== [7] Setup conda for future shells ==="
 if ! grep -q "/opt/miniconda3/bin/conda" /root/.bashrc 2>/dev/null; then
