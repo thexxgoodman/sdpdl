@@ -60,7 +60,7 @@ else
   echo "Conda env 'pandorapdl' already exists, skipping."
 fi
 
-echo "=== [3] Ensure git + ffmpeg installed ==="
+echo "=== [3] Ensure git + ffmpeg (system) installed ==="
 if ! command -v git >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
@@ -77,6 +77,31 @@ else
   echo "EchoMimicV2 already exists, pulling latest..."
   cd "$ECHOMIMIC_DIR"
   git pull --rebase || true
+fi
+
+cd "$ECHOMIMIC_DIR"
+
+echo "=== [4.1] Download ffmpeg-static for EchoMimic ==="
+# EchoMimic использует FFMPEG_PATH для финального рендера видео.
+# Скачиваем статический бинарь прямо в папку EchoMimic.
+FFMPEG_STATIC_DIR="$ECHOMIMIC_DIR/ffmpeg-static"
+if [ ! -d "$FFMPEG_STATIC_DIR" ]; then
+  echo "Downloading ffmpeg-static..."
+  cd "$ECHOMIMIC_DIR"
+  wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+    -O /tmp/ffmpeg-static.tar.xz
+  tar -xf /tmp/ffmpeg-static.tar.xz -C "$ECHOMIMIC_DIR"
+  rm /tmp/ffmpeg-static.tar.xz
+  # Переименовываем папку вида ffmpeg-*-amd64-static → ffmpeg-static
+  for d in "$ECHOMIMIC_DIR"/ffmpeg-*-amd64-static; do
+    if [ -d "$d" ]; then
+      mv "$d" "$FFMPEG_STATIC_DIR"
+      break
+    fi
+  done
+  echo "ffmpeg-static installed: $FFMPEG_STATIC_DIR"
+else
+  echo "ffmpeg-static already exists, skipping."
 fi
 
 cd "$ECHOMIMIC_DIR"
@@ -173,12 +198,18 @@ for fname in ["denoising_unet_acc.pth", "reference_unet.pth",
     dl("BadToBest/EchoMimicV2", fname, weights_dir)
 
 print("[6.2] sd-image-variations-diffusers (reference UNet base)")
-vae_dir = os.path.join(weights_dir, "sd-image-variations-diffusers")
-os.makedirs(vae_dir, exist_ok=True)
+sd_dir = os.path.join(weights_dir, "sd-image-variations-diffusers")
+os.makedirs(sd_dir, exist_ok=True)
 subprocess.run([hf_cli, "download", "lambdalabs/sd-image-variations-diffusers",
+                "--local-dir", sd_dir], check=False)
+
+print("[6.3] sd-vae-ft-mse (VAE)")
+vae_dir = os.path.join(weights_dir, "sd-vae-ft-mse")
+os.makedirs(vae_dir, exist_ok=True)
+subprocess.run([hf_cli, "download", "stabilityai/sd-vae-ft-mse",
                 "--local-dir", vae_dir], check=False)
 
-print("[6.3] Whisper tiny → ~/.cache/whisper/tiny.pt")
+print("[6.4] Whisper tiny → ~/.cache/whisper/tiny.pt")
 cache_dir = os.path.expanduser("~/.cache/whisper")
 os.makedirs(cache_dir, exist_ok=True)
 whisper_dst = os.path.join(cache_dir, "tiny.pt")
@@ -204,6 +235,7 @@ fi
 echo "=== [DONE] Provisioning finished ==="
 echo "Project dir:   $PROJECT_DIR"
 echo "EchoMimic V2:  $ECHOMIMIC_DIR"
+echo "ffmpeg-static: $ECHOMIMIC_DIR/ffmpeg-static"
 echo "Envs:          echomimic (py3.10), pandorapdl (py3.12)"
 echo "PyTorch:       nightly cu128 (RTX 5090 Blackwell)"
 
