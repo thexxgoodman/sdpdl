@@ -83,7 +83,7 @@ cd "$ECHOMIMIC_DIR"
 
 echo "=== [5] Install EchoMimic requirements ==="
 
-# Находим pip для echomimic env (может быть в /venv или /opt/miniconda3/envs)
+# Находим pip для echomimic env
 EM_PIP=""
 for p in /venv/echomimic/bin/pip /opt/miniconda3/envs/echomimic/bin/pip; do
   if [ -x "$p" ]; then
@@ -98,43 +98,34 @@ if [ -z "$EM_PIP" ]; then
 fi
 
 echo "Using pip: $EM_PIP"
-
-# Обновляем pip
 "$EM_PIP" install --upgrade pip --quiet
 
-# ВАЖНО: сначала фиксим setuptools глобально И в env —
-# pip создаёт изолированные /tmp envs при сборке пакетов,
-# и там тоже нужен setuptools<70
-echo "=== [5.1] Fix setuptools BEFORE anything else ==="
+# ВАЖНО: фиксим setuptools ПЕРВЫМ — до любых других пакетов.
+# pip создаёт изолированные /tmp envs при сборке, и там тоже нужен setuptools<70.
+echo "=== [5.1] Fix setuptools ==="
 pip install "setuptools<70" --force-reinstall --quiet || true
 "$EM_PIP" install "setuptools<70" --force-reinstall --quiet
 
-# Проверяем
-"$EM_PIP" python -c "import pkg_resources; print('pkg_resources OK')" 2>/dev/null || \
-  echo "WARNING: pkg_resources check failed, continuing anyway"
+# PyTorch nightly cu128 — необходимо для RTX 5090 (Blackwell sm_120).
+# PyTorch 2.5.x stable собран только до sm_90 (H100) и падает с
+# "no kernel image is available for execution on the device" на RTX 5090.
+echo "=== [5.2] Install PyTorch nightly (cu128, RTX 5090 Blackwell) ==="
+"$EM_PIP" install --pre torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/nightly/cu128 \
+  --force-reinstall --quiet
 
-# PyTorch 2.5.1 + CUDA 12.4 (совместимо с драйвером 12.8 на Vast.ai)
-echo "=== [5.2] Install PyTorch ==="
-"$EM_PIP" install \
-  torch==2.5.1 \
-  torchvision==0.20.1 \
-  torchaudio==2.5.1 \
-  xformers==0.0.28.post3 \
-  --index-url https://download.pytorch.org/whl/cu124 --quiet
-
-# torchao для ускорения (опционально)
-"$EM_PIP" install torchao \
-  --index-url https://download.pytorch.org/whl/nightly/cu124 --quiet || \
+# torchao для дополнительного ускорения (опционально)
+"$EM_PIP" install --pre torchao \
+  --index-url https://download.pytorch.org/whl/nightly/cu128 --quiet || \
   echo "WARNING: torchao install failed — continuing without it"
 
 # clip устанавливаем отдельно с --no-build-isolation
 # чтобы обойти проблему с pkg_resources в /tmp изоляции
 echo "=== [5.3] Install clip ==="
-"$EM_PIP" install \
-  "git+https://github.com/openai/CLIP.git" \
+"$EM_PIP" install "git+https://github.com/openai/CLIP.git" \
   --no-build-isolation --quiet
 
-# Основные зависимости EchoMimic — тоже с --no-build-isolation
+# Основные зависимости EchoMimic с --no-build-isolation
 echo "=== [5.4] Install EchoMimic requirements.txt ==="
 "$EM_PIP" install -r requirements.txt --no-build-isolation --quiet
 
@@ -143,6 +134,8 @@ echo "=== [5.4] Install EchoMimic requirements.txt ==="
 "$EM_PIP" install pyyaml --quiet
 
 echo "=== [6] Download EchoMimic pretrained weights ==="
+
+# Находим python для echomimic env
 EM_PYTHON=""
 for p in /venv/echomimic/bin/python /opt/miniconda3/envs/echomimic/bin/python; do
   if [ -x "$p" ]; then
@@ -160,9 +153,8 @@ echomimic_dir = os.environ.get("ECHOMIMIC_DIR", "/workspace/PandoraPDL/EchoMimic
 weights_dir   = echomimic_dir + "/pretrained_weights"
 os.makedirs(weights_dir, exist_ok=True)
 
-# Ищем huggingface-cli рядом с текущим python
 python_bin = sys.executable
-hf_cli     = python_bin.replace("python", "huggingface-cli")
+hf_cli     = os.path.join(os.path.dirname(python_bin), "huggingface-cli")
 if not os.path.exists(hf_cli):
     hf_cli = "huggingface-cli"
 
@@ -180,25 +172,26 @@ for fname in ["denoising_unet_acc.pth", "reference_unet.pth",
               "motion_module_acc.pth", "pose_encoder.pth"]:
     dl("BadToBest/EchoMimicV2", fname, weights_dir)
 
-print("[6.2] VAE sd-vae-ft-mse")
-vae_dir = os.path.join(weights_dir, "sd-vae-ft-mse")
+print("[6.2] sd-image-variations-diffusers (reference UNet base)")
+vae_dir = os.path.join(weights_dir, "sd-image-variations-diffusers")
 os.makedirs(vae_dir, exist_ok=True)
-subprocess.run([hf_cli, "download", "stabilityai/sd-vae-ft-mse",
+subprocess.run([hf_cli, "download", "lambdalabs/sd-image-variations-diffusers",
                 "--local-dir", vae_dir], check=False)
 
-print("[6.3] Whisper tiny")
-audio_dir = os.path.join(weights_dir, "audio_processor")
-os.makedirs(audio_dir, exist_ok=True)
-whisper_path = os.path.join(audio_dir, "tiny.pt")
-if not os.path.exists(whisper_path):
-    subprocess.run([hf_cli, "download", "openai/whisper-tiny",
-                    "--local-dir", audio_dir], check=False)
-    # Переименовываем если нужно
-    for candidate in ["pytorch_model.bin", "model.safetensors"]:
-        src = os.path.join(audio_dir, candidate)
-        if os.path.exists(src) and not os.path.exists(whisper_path):
-            os.rename(src, whisper_path)
-            break
+print("[6.3] Whisper tiny → ~/.cache/whisper/tiny.pt")
+cache_dir = os.path.expanduser("~/.cache/whisper")
+os.makedirs(cache_dir, exist_ok=True)
+whisper_dst = os.path.join(cache_dir, "tiny.pt")
+if not os.path.exists(whisper_dst):
+    url = ("https://openaipublic.azureedge.net/main/whisper/models/"
+           "65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt")
+    subprocess.run(["wget", "-q", "-O", whisper_dst, url], check=False)
+    if os.path.exists(whisper_dst):
+        print("  Whisper tiny downloaded OK")
+    else:
+        print("  WARNING: whisper tiny download failed")
+else:
+    print("  Already exists: tiny.pt")
 
 print("Weights download complete.")
 PYEOF
@@ -212,6 +205,7 @@ echo "=== [DONE] Provisioning finished ==="
 echo "Project dir:   $PROJECT_DIR"
 echo "EchoMimic V2:  $ECHOMIMIC_DIR"
 echo "Envs:          echomimic (py3.10), pandorapdl (py3.12)"
+echo "PyTorch:       nightly cu128 (RTX 5090 Blackwell)"
 
 # ── Telegram-уведомление ──────────────────────────────────────────────────────
 if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
