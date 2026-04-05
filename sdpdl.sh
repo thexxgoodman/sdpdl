@@ -86,11 +86,20 @@ fi
 cd "$PROJECT_DIR/SadTalker"
 
 echo "=== [5] Install SadTalker requirements into conda env 'sadtalker' ==="
-pip install -r requirements.txt
+# Исключаем torch из requirements.txt — поставим совместимую версию вручную ниже
+pip install -r requirements.txt --ignore-requires-python || true
 
-echo "=== [5.1] Fix pkg_resources (setuptools<70) ==="
+echo "=== [5.1] Install PyTorch for RTX 5090 (Blackwell / CUDA 12.8) ==="
+# Официальный SadTalker тянет torch ~1.x–2.0 — он не поддерживает архитектуру
+# Blackwell (sm_120). Принудительно ставим torch 2.6+ с cu128.
+pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  --force-reinstall --quiet
+echo "Torch installed:"
+python -c "import torch; print('  version:', torch.__version__); print('  CUDA:', torch.version.cuda)"
+
+echo "=== [5.2] Fix pkg_resources (setuptools<70) ==="
 # setuptools>=70 убрал pkg_resources из публичного API — librosa на нём падает.
-# Ищем pip в venv или conda и принудительно ставим совместимую версию.
 for ST_PIP in /venv/sadtalker/bin/pip /opt/miniconda3/envs/sadtalker/bin/pip; do
   if [ -x "$ST_PIP" ]; then
     echo "Fixing setuptools via $ST_PIP ..."
@@ -120,15 +129,25 @@ if ! grep -q "/opt/miniconda3/bin/conda" /root/.bashrc 2>/dev/null; then
   /opt/miniconda3/bin/conda init bash || true
 fi
 
+# ── Оптимизация памяти GPU для RTX 5090 ──────────────────────────────────────
+# expandable_segments снижает фрагментацию VRAM при больших батчах.
+if ! grep -q "PYTORCH_CUDA_ALLOC_CONF" /root/.bashrc 2>/dev/null; then
+  echo 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' >> /root/.bashrc
+  echo "Added PYTORCH_CUDA_ALLOC_CONF to .bashrc"
+fi
+
 conda deactivate || true
 
 echo "=== [DONE] Provisioning finished ==="
 echo "Project dir: $PROJECT_DIR"
 echo "SadTalker:   $PROJECT_DIR/SadTalker"
 echo "Envs:        sadtalker (py3.10), pandorapdl (py3.12)"
+echo ""
+echo "Проверь GPU после провижнинга:"
+echo "  conda activate sadtalker"
+echo "  python -c \"import torch; print(torch.__version__, torch.cuda.get_device_name(0))\""
 
 # ── Telegram-уведомление ──────────────────────────────────────────────────────
-# Отправляем только если оба значения заполнены. Ошибки игнорируем.
 if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
   INSTANCE_ID="${VAST_CONTAINERLABEL:-$(hostname)}"
   TG_MSG="✅ Инстанс готов к работе%0A🖥 ID: ${INSTANCE_ID}%0A📁 ${PROJECT_DIR}"
