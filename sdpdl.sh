@@ -12,8 +12,8 @@
 set -eo pipefail
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-TG_BOT_TOKEN=""
-TG_CHAT_ID=""
+TG_BOT_TOKEN="8723700413:AAEbvAxPLI5iK4UlWlKf6wMVzCMTpK1jVxU"
+TG_CHAT_ID="-1003856343516"
 
 tg_send() {
   local msg="$1"
