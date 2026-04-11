@@ -141,6 +141,16 @@ python -c "import torch; assert '2.' in torch.__version__, 'wrong version'" \
 echo "  torch: $TORCH_VER OK"
 
 echo "=== [5.1] Pin problematic packages for py3.10 ==="
+# scikit-learn>=1.6, PyWavelets>=1.8, pandas>=2.3 требуют Python 3.11+
+# Создаём constraints файл — блокирует версии даже для транзитивных зависимостей
+# (когда другой пакет тянет scikit-learn как зависимость — pip всё равно возьмёт <1.6)
+cat > /tmp/constraints.txt <<'EOF'
+scikit-learn<1.6
+PyWavelets<1.8
+pandas<2.3
+numpy<2.0
+EOF
+
 pip install \
   "scikit-learn<1.6" \
   "PyWavelets<1.8" \
@@ -151,9 +161,13 @@ pip install \
 echo "  Pinned packages OK."
 
 echo "=== [5.2] Install SadTalker requirements ==="
+# Фильтруем пинованные пакеты из requirements
+# --constraint гарантирует что даже транзитивные зависимости не выйдут за пины
 grep -iEv '^\s*(torch|torchvision|torchaudio|scikit.learn|sklearn|pywavelets|pandas|numpy)' \
   requirements.txt > /tmp/requirements_notorch.txt
-pip install -r /tmp/requirements_notorch.txt --ignore-requires-python \
+pip install -r /tmp/requirements_notorch.txt \
+  --constraint /tmp/constraints.txt \
+  --ignore-requires-python \
   || { tg_error "[5.2] requirements" "Ошибка установки зависимостей SadTalker"; exit 1; }
 echo "  SadTalker requirements OK."
 
