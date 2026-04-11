@@ -1,27 +1,49 @@
 #!/bin/bash
-# Provisioning script for Vast.ai
-# Miniconda + envs: sadtalker (py3.10), pandorapdl (py3.12)
-# Структура проекта:
-#   /workspace/PandoraPDL
-#   /workspace/PandoraPDL/SadTalker
+# spdl.sh — Provisioning script for Vast.ai
+#
+# Что делает:
+#   1. Создаёт структуру папок /workspace/Pandora/
+#   2. Устанавливает conda окружение 'sadtalker' (py3.10)
+#   3. Клонирует SadTalker
+#   4. Устанавливает torch cu128 (RTX 5090 / Blackwell)
+#   5. Устанавливает зависимости SadTalker (без перезаписи torch)
+#   6. Скачивает модели SadTalker
+#   7. Патчит basicsr и animate.py (fp16 + torch.compile)
+#   8. Создаёт conda окружение 'demucs' (audio separation)
+#
+# После выполнения вручную перенести:
+#   sadtalker_runner.py  → /workspace/Pandora/sadtalker/
+#   audio_clean.py       → /workspace/Pandora/demucs/
+#   test/                → /workspace/Pandora/sadtalker/test/
 
 set -eo pipefail
 
 # ── Telegram-уведомление (опционально) ───────────────────────────────────────
-TG_BOT_TOKEN=""
-TG_CHAT_ID=""
+TG_BOT_TOKEN="8723700413:AAEbvAxPLI5iK4UlWlKf6wMVzCMTpK1jVxU"
+TG_CHAT_ID="-1003856343516"
 # ─────────────────────────────────────────────────────────────────────────────
 
-echo "=== [0] Detect workspace and project dir ==="
+echo "=== [0] Setup directories ==="
 WORKSPACE="${WORKSPACE:-/workspace}"
-PROJECT_DIR="$WORKSPACE/PandoraPDL"
+PANDORA_DIR="$WORKSPACE/Pandora"
+ST_DIR="$PANDORA_DIR/sadtalker"
+ST_REPO="$ST_DIR/SadTalker"
+DEMUCS_DIR="$PANDORA_DIR/demucs"
 
-mkdir -p "$PROJECT_DIR"
-cd "$PROJECT_DIR"
+mkdir -p "$PANDORA_DIR/myproject"
+mkdir -p "$ST_DIR"
+mkdir -p "$ST_DIR/test/input"
+mkdir -p "$ST_DIR/test/output"
+mkdir -p "$ST_DIR/test/log"
+mkdir -p "$DEMUCS_DIR/test/input"
+mkdir -p "$DEMUCS_DIR/test/output"
 
-echo "WORKSPACE   = $WORKSPACE"
-echo "PROJECT_DIR = $PROJECT_DIR"
+echo "PANDORA_DIR  = $PANDORA_DIR"
+echo "ST_DIR       = $ST_DIR"
+echo "ST_REPO      = $ST_REPO"
+echo "DEMUCS_DIR   = $DEMUCS_DIR"
 
+# ─────────────────────────────────────────────────────────────────────────────
 echo "=== [1] Install Miniconda (if needed) ==="
 if [ ! -x /opt/miniconda3/bin/conda ]; then
   echo "Miniconda not found, installing..."
@@ -32,32 +54,27 @@ else
   echo "Miniconda already installed, skipping."
 fi
 
-echo "=== [2] Init conda in bash ==="
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [2] Init conda ==="
 eval "$(/opt/miniconda3/bin/conda shell.bash hook)"
 
-echo "=== [2.1] Accept Anaconda Terms of Service ==="
+echo "=== [2.1] Accept Anaconda TOS ==="
 set +e
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 set -e
 
-echo "=== [2.2] Create envs ==="
+echo "=== [2.2] Create conda env 'sadtalker' (py3.10) ==="
 if ! conda env list | grep -qE '^sadtalker[[:space:]]'; then
   conda create -y -n sadtalker python=3.10
 else
   echo "Conda env 'sadtalker' already exists, skipping."
 fi
 
-if ! conda env list | grep -qE '^pandorapdl[[:space:]]'; then
-  conda create -y -n pandorapdl python=3.12
-else
-  echo "Conda env 'pandorapdl' already exists, skipping."
-fi
-
-echo "=== [2.3] Activate 'sadtalker' ==="
 conda activate sadtalker
 python -m pip install --upgrade pip
 
+# ─────────────────────────────────────────────────────────────────────────────
 echo "=== [3] Ensure git + ffmpeg ==="
 if ! command -v git >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
@@ -67,31 +84,28 @@ if ! command -v git >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
   fi
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
 echo "=== [4] Clone or update SadTalker ==="
-if [ ! -d "$PROJECT_DIR/SadTalker/.git" ]; then
-  git clone https://github.com/OpenTalker/SadTalker.git "$PROJECT_DIR/SadTalker"
+if [ ! -d "$ST_REPO/.git" ]; then
+  git clone https://github.com/OpenTalker/SadTalker.git "$ST_REPO"
 else
   echo "SadTalker already exists, pulling latest..."
-  cd "$PROJECT_DIR/SadTalker"
+  cd "$ST_REPO"
   git pull --rebase || true
 fi
 
-cd "$PROJECT_DIR/SadTalker"
+cd "$ST_REPO"
 
+# ─────────────────────────────────────────────────────────────────────────────
 echo "=== [5] Install PyTorch for RTX 5090 (Blackwell / CUDA 12.8) FIRST ==="
-# Ставим torch ДО requirements.txt — иначе requirements перезапишет его старой версией
 pip install torch torchvision torchaudio \
   --index-url https://download.pytorch.org/whl/cu128 \
   --quiet
 echo "Torch installed:"
 python -c "import torch; print('  version:', torch.__version__); print('  CUDA:', torch.version.cuda)"
 
-echo "=== [5.1] Install SadTalker requirements (без перезаписи torch) ==="
-# Фильтруем строки с torch/torchvision/torchaudio из requirements.txt
-# чтобы pip не откатил только что установленный torch 2.6+
+echo "=== [5.1] Install SadTalker requirements (без torch) ==="
 grep -iEv '^\s*(torch|torchvision|torchaudio)' requirements.txt > /tmp/requirements_notorch.txt
-echo "Filtered requirements (torch excluded):"
-cat /tmp/requirements_notorch.txt
 pip install -r /tmp/requirements_notorch.txt --ignore-requires-python || true
 
 echo "=== [5.2] Install opencv-python ==="
@@ -100,12 +114,11 @@ pip install opencv-python --quiet
 echo "=== [5.3] Fix pkg_resources (setuptools<70) ==="
 for ST_PIP in /venv/sadtalker/bin/pip /opt/miniconda3/envs/sadtalker/bin/pip; do
   if [ -x "$ST_PIP" ]; then
-    echo "Fixing setuptools via $ST_PIP ..."
     "$ST_PIP" install "setuptools<70" --force-reinstall --quiet || true
   fi
 done
 
-echo "=== [5.4] Verify torch is still correct version ==="
+echo "=== [5.4] Verify torch version ==="
 python -c "
 import torch
 v = torch.__version__
@@ -115,9 +128,18 @@ assert '2.' in v, f'ERROR: torch version is {v}, expected 2.x!'
 print('  OK: torch 2.x confirmed')
 "
 
+# ─────────────────────────────────────────────────────────────────────────────
 echo "=== [6] Download SadTalker models ==="
 bash scripts/download_models.sh
 
+echo "=== [6.1] Verify models downloaded ==="
+if [ ! -f "$ST_REPO/checkpoints/SadTalker_V0.0.2_256.safetensors" ]; then
+  echo "ERROR: SadTalker models not downloaded!" >&2
+  exit 1
+fi
+echo "Models OK."
+
+# ─────────────────────────────────────────────────────────────────────────────
 echo "=== [7] Fix basicsr rgb_to_grayscale import ==="
 CANDIDATES=(
   "/venv/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"
@@ -132,14 +154,14 @@ for f in "${CANDIDATES[@]}"; do
   fi
 done
 
+# ─────────────────────────────────────────────────────────────────────────────
 echo "=== [8] Patch animate.py for fp16 + torch.compile (RTX 5090) ==="
-python3 - "$PROJECT_DIR/SadTalker/src/facerender/animate.py" <<'PYEOF'
+python3 - "$ST_REPO/src/facerender/animate.py" <<'PYEOF'
 import sys
 path = sys.argv[1]
 text = open(path).read()
 
 patches = [
-    # Патч 1: fp16 для моделей после .to(device)
     (
         """        generator.to(device)
         kp_extractor.to(device)
@@ -156,7 +178,6 @@ patches = [
             mapping.half()""",
         "fp16 models"
     ),
-    # Патч 2: torch.compile после .eval()
     (
         """        self.kp_extractor.eval()
         self.generator.eval()
@@ -173,7 +194,6 @@ patches = [
             self.mapping = torch.compile(self.mapping, mode="default")""",
         "torch.compile"
     ),
-    # Патч 3: входные тензоры в fp16
     (
         """        source_image=source_image.to(self.device)
         source_semantics=source_semantics.to(self.device)
@@ -187,7 +207,6 @@ patches = [
             target_semantics=target_semantics.half()""",
         "fp16 tensors"
     ),
-    # Патч 4: use_half=True в вызове make_animation
     (
         "yaw_c_seq, pitch_c_seq, roll_c_seq, use_exp = True)",
         "yaw_c_seq, pitch_c_seq, roll_c_seq, use_exp=True, use_half=True)",
@@ -210,34 +229,76 @@ else:
     print("  No changes needed.")
 PYEOF
 
-echo "=== [9] Setup conda + env vars ==="
-if ! grep -q "/opt/miniconda3/bin/conda" /root/.bashrc 2>/dev/null; then
-  /opt/miniconda3/bin/conda init bash || true
+conda deactivate || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [9] Setup demucs env (audio separation) ==="
+
+if ! conda env list | grep -qE '^demucs[[:space:]]'; then
+  conda create -y -n demucs python=3.10
+else
+  echo "Conda env 'demucs' already exists, skipping."
 fi
 
-if ! grep -q "PYTORCH_CUDA_ALLOC_CONF" /root/.bashrc 2>/dev/null; then
-  echo 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' >> /root/.bashrc
-  echo "Added PYTORCH_CUDA_ALLOC_CONF to .bashrc"
-fi
+conda activate demucs
+python -m pip install --upgrade pip
+
+pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  --quiet
+
+pip install demucs --quiet
+
+python -c "
+import torch, demucs
+print('  demucs OK')
+print('  CUDA available:', torch.cuda.is_available())
+print('  torch:', torch.__version__)
+"
 
 conda deactivate || true
 
+# ─────────────────────────────────────────────────────────────────────────────
+echo "=== [10] Setup conda + env vars ==="
+if ! grep -q "/opt/miniconda3/bin/conda" /root/.bashrc 2>/dev/null; then
+  /opt/miniconda3/bin/conda init bash || true
+fi
+if ! grep -q "PYTORCH_CUDA_ALLOC_CONF" /root/.bashrc 2>/dev/null; then
+  echo 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' >> /root/.bashrc
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== [DONE] Provisioning finished ==="
-echo "Project dir: $PROJECT_DIR"
-echo "SadTalker:   $PROJECT_DIR/SadTalker"
-echo "Envs:        sadtalker (py3.10), pandorapdl (py3.12)"
 echo ""
-echo "Проверь GPU:"
-echo "  conda activate sadtalker"
-echo "  python -c \"import torch; print(torch.__version__, torch.cuda.get_device_name(0))\""
+echo "Структура готова:"
+echo "  $PANDORA_DIR/"
+echo "  ├── sadtalker/"
+echo "  │   ├── SadTalker/           ← готово"
+echo "  │   └── test/"
+echo "  │       ├── input/           ← положи audio.mp3 + face.png"
+echo "  │       ├── output/"
+echo "  │       └── log/"
+echo "  ├── demucs/"
+echo "  │   └── test/"
+echo "  │       ├── input/               ← положи трек с музыкой"
+echo "  │       ├── output/              ← сюда ляжет чистая речь"
+echo "  │       ├── test_audio.py        ← перенести вручную"
+echo "  │       └── run_test.sh          ← перенести вручную"
+echo "  └── myproject/"
+echo ""
+echo "Далее вручную:"
+echo "  1. Перенеси sadtalker_runner.py → $ST_DIR/"
+echo "  2. Перенеси audio_clean.py      → $DEMUCS_DIR/"
+echo "  3. Положи track.mp3 в $DEMUCS_DIR/input/"
+echo "  4. conda activate demucs && python $DEMUCS_DIR/audio_clean.py $DEMUCS_DIR/input/track.mp3"
 
 # ── Telegram-уведомление ──────────────────────────────────────────────────────
 if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
   INSTANCE_ID="${VAST_CONTAINERLABEL:-$(hostname)}"
-  TG_MSG="✅ Инстанс готов к работе%0A🖥 ID: ${INSTANCE_ID}%0A📁 ${PROJECT_DIR}"
+  TG_MSG="✅ Инстанс готов%0A🖥 ID: ${INSTANCE_ID}%0A📁 ${PANDORA_DIR}"
   curl -s --max-time 10 \
-    "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    "https://api.anthropic.com/bot${TG_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TG_CHAT_ID}&text=${TG_MSG}" \
     > /dev/null 2>&1 || true
 fi
