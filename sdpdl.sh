@@ -8,12 +8,14 @@
 # После выполнения вручную перенести:
 #   sadtalker_runner.py → /workspace/Pandora/sadtalker/
 #   test/* файлы        → /workspace/Pandora/sadtalker/test/
+#   audio_clean.py      → /workspace/Pandora/demucs/
+#   test/* файлы        → /workspace/Pandora/demucs/test/
 
 set -eo pipefail
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-TG_BOT_TOKEN="8723700413:AAEbvAxPLI5iK4UlWlKf6wMVzCMTpK1jVxU"
-TG_CHAT_ID="-1003856343516"
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
 
 tg_send() {
   local msg="$1"
@@ -38,7 +40,6 @@ tg_ok() {
   tg_send "✅ ${msg}"
 }
 
-# Глобальный перехват ошибок — если что-то упало без явной обработки
 trap 'tg_error "НЕОЖИДАННАЯ ОШИБКА" "Строка $LINENO — скрипт завершился аварийно"' ERR
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -147,7 +148,7 @@ echo "=== [5.1] Pin problematic packages for py3.10 ==="
 #   pandas>=2.3         → py3.11+
 #   contourpy>=1.3      → py3.11+ (тянется через matplotlib→filterpy→facexlib)
 #   matplotlib>=3.10    → тянет новый contourpy
-# constraints файл блокирует эти версии даже для транзитивных зависимостей
+#   numpy>=1.24         → убрал np.float который использует SadTalker в my_awing_arch.py
 cat > /tmp/constraints.txt <<'EOF'
 scikit-learn<1.6
 PyWavelets<1.8
@@ -157,7 +158,6 @@ contourpy<1.3
 matplotlib<3.10
 EOF
 
-# numpy<1.24 — numpy>=1.24 убрал np.float который использует SadTalker в my_awing_arch.py
 pip install \
   "scikit-learn<1.6" \
   "PyWavelets<1.8" \
@@ -170,8 +170,6 @@ pip install \
 echo "  Pinned packages OK."
 
 echo "=== [5.2] Install SadTalker requirements ==="
-# Фильтруем из requirements все пакеты которые уже установлены с нужными версиями
-# --constraint гарантирует что транзитивные зависимости тоже не выйдут за пины
 grep -iEv '^\s*(torch|torchvision|torchaudio|scikit.learn|sklearn|pywavelets|pandas|numpy|contourpy|matplotlib)' \
   requirements.txt > /tmp/requirements_notorch.txt
 pip install -r /tmp/requirements_notorch.txt \
@@ -198,8 +196,9 @@ print('  torch:', torch.__version__)
 print('  numpy:', numpy.__version__)
 print('  CUDA:', torch.cuda.is_available())
 assert '2.' in torch.__version__
+assert numpy.__version__ < '1.24', f'numpy too new: {numpy.__version__}'
 print('  OK')
-" || { tg_error "[5.5] verify sadtalker" "Проверка зависимостей sadtalker провалилась — что-то не установилось"; exit 1; }
+" || { tg_error "[5.5] verify sadtalker" "Проверка зависимостей sadtalker провалилась"; exit 1; }
 
 echo "=== [6] Download SadTalker models ==="
 bash scripts/download_models.sh \
@@ -207,7 +206,7 @@ bash scripts/download_models.sh \
 
 echo "=== [6.1] Verify models ==="
 if [ ! -f "$ST_REPO/checkpoints/SadTalker_V0.0.2_256.safetensors" ]; then
-  tg_error "[6.1] models verify" "Модели SadTalker не скачались — файл SadTalker_V0.0.2_256.safetensors отсутствует"
+  tg_error "[6.1] models verify" "Модели SadTalker не скачались — файл отсутствует"
   exit 1
 fi
 echo "  Models OK."
@@ -310,17 +309,12 @@ echo "=== [9] Setup demucs ==="
 conda activate demucs
 python -m pip install --upgrade pip --quiet
 
-pip install torch==2.11.0 torchvision \
+# Весь torch стек из cu128 — RTX 5090 (Blackwell sm_120) требует cu128
+# torchaudio==2.11.0+cu128 существует и совместим с torch==2.11.0+cu128
+pip install torch==2.11.0 torchvision torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu128 \
   --quiet \
-  || { tg_error "[9] torch demucs" "Ошибка установки PyTorch в demucs"; exit 1; }
-
-# torchaudio==2.1.0 — новый torchaudio требует torchcodec которого нет
-# старая версия использует soundfile бэкенд без torchcodec
-pip install torchaudio==2.1.0 \
-  --index-url https://download.pytorch.org/whl/cu121 \
-  --quiet \
-  || { tg_error "[9] torchaudio demucs" "Ошибка установки torchaudio==2.1.0 в demucs"; exit 1; }
+  || { tg_error "[9] torch demucs" "Ошибка установки PyTorch стека в demucs"; exit 1; }
 
 TORCH_VER=$(python -c "import torch; print(torch.__version__)")
 echo "  torch: $TORCH_VER"
@@ -331,14 +325,47 @@ pip install "numpy<2.0" --quiet \
 pip install demucs soundfile --quiet \
   || { tg_error "[9] demucs install" "Ошибка установки demucs/soundfile"; exit 1; }
 
-echo "=== [9.1] Verify demucs ==="
+echo "=== [9.1] Patch demucs/audio.py (soundfile вместо torchaudio.save) ==="
+# torchaudio 2.11 использует torchcodec для сохранения файлов — он не работает.
+# Патчим demucs/audio.py чтобы использовал soundfile напрямую.
+python3 - <<'PYEOF'
+import subprocess, sys
+
+result = subprocess.run(
+    [sys.executable, '-c', 'import demucs.audio; print(demucs.audio.__file__)'],
+    capture_output=True, text=True
+)
+path = result.stdout.strip()
+print(f"  Patching {path}")
+
+text = open(path).read()
+
+old = """        ta.save(str(path), wav, sample_rate=samplerate,
+                encoding=encoding, bits_per_sample=bits_per_sample)
+    elif suffix == ".flac":
+        ta.save(str(path), wav, sample_rate=samplerate, bits_per_sample=bits_per_sample)"""
+
+new = """        import soundfile as sf
+        sf.write(str(path), wav.squeeze(0).T.numpy(), samplerate)
+    elif suffix == ".flac":
+        import soundfile as sf
+        sf.write(str(path), wav.squeeze(0).T.numpy(), samplerate)"""
+
+if old in text:
+    open(path, 'w').write(text.replace(old, new))
+    print("  Patched: ta.save → soundfile.write")
+else:
+    print("  SKIP: patch already applied or not found")
+PYEOF
+
+echo "=== [9.2] Verify demucs ==="
 python -c "
 import torch, numpy, demucs, soundfile
 print('  torch:', torch.__version__)
 print('  numpy:', numpy.__version__)
 print('  CUDA:', torch.cuda.is_available())
 print('  demucs OK | soundfile OK')
-" || { tg_error "[9.1] verify demucs" "Проверка зависимостей demucs провалилась"; exit 1; }
+" || { tg_error "[9.2] verify demucs" "Проверка зависимостей demucs провалилась"; exit 1; }
 
 tg_ok "[Demucs] Установка завершена успешно ✅"
 conda deactivate || true
@@ -352,7 +379,6 @@ if ! grep -q "PYTORCH_CUDA_ALLOC_CONF" /root/.bashrc 2>/dev/null; then
   echo 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' >> /root/.bashrc
 fi
 
-# Снимаем глобальный trap — всё прошло успешно
 trap - ERR
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,5 +397,7 @@ echo ""
 echo "Вручную перенести:"
 echo "  sadtalker_runner.py → $ST_DIR/"
 echo "  test/* файлы        → $ST_DIR/test/"
+echo "  audio_clean.py      → $DEMUCS_DIR/"
+echo "  test/* файлы        → $DEMUCS_DIR/test/"
 
-tg_send "🎉 Провижнинг завершён полностью%0A%0A📁 ${PANDORA_DIR}%0A🐍 sadtalker: py3.10%0A🎵 demucs: py3.10%0A%0AВручную перенеси:%0A• sadtalker_runner.py → sadtalker/%0A• test/* → sadtalker/test/"
+tg_send "🎉 Провижнинг завершён%0A%0A📁 ${PANDORA_DIR}%0A🐍 sadtalker: py3.10%0A🎵 demucs: py3.10"
