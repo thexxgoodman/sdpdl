@@ -12,8 +12,8 @@
 set -eo pipefail
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-TG_BOT_TOKEN=""
-TG_CHAT_ID=""
+TG_BOT_TOKEN="8723700413:AAEbvAxPLI5iK4UlWlKf6wMVzCMTpK1jVxU"
+TG_CHAT_ID="-1003856343516"
 
 tg_send() {
   local msg="$1"
@@ -152,16 +152,17 @@ cat > /tmp/constraints.txt <<'EOF'
 scikit-learn<1.6
 PyWavelets<1.8
 pandas<2.3
-numpy<2.0
+numpy<1.24
 contourpy<1.3
 matplotlib<3.10
 EOF
 
+# numpy<1.24 — numpy>=1.24 убрал np.float который использует SadTalker в my_awing_arch.py
 pip install \
   "scikit-learn<1.6" \
   "PyWavelets<1.8" \
   "pandas<2.3" \
-  "numpy<2.0" \
+  "numpy<1.24" \
   "contourpy<1.3" \
   "matplotlib<3.10" \
   --quiet \
@@ -309,10 +310,17 @@ echo "=== [9] Setup demucs ==="
 conda activate demucs
 python -m pip install --upgrade pip --quiet
 
-pip install torch==2.11.0 torchvision torchaudio \
+pip install torch==2.11.0 torchvision \
   --index-url https://download.pytorch.org/whl/cu128 \
   --quiet \
   || { tg_error "[9] torch demucs" "Ошибка установки PyTorch в demucs"; exit 1; }
+
+# torchaudio==2.1.0 — новый torchaudio требует torchcodec которого нет
+# старая версия использует soundfile бэкенд без torchcodec
+pip install torchaudio==2.1.0 \
+  --index-url https://download.pytorch.org/whl/cu121 \
+  --quiet \
+  || { tg_error "[9] torchaudio demucs" "Ошибка установки torchaudio==2.1.0 в demucs"; exit 1; }
 
 TORCH_VER=$(python -c "import torch; print(torch.__version__)")
 echo "  torch: $TORCH_VER"
