@@ -12,8 +12,8 @@
 set -eo pipefail
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-TG_BOT_TOKEN="8723700413:AAEbvAxPLI5iK4UlWlKf6wMVzCMTpK1jVxU"
-TG_CHAT_ID="-1003856343516"
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
 
 tg_send() {
   local msg="$1"
@@ -141,14 +141,20 @@ python -c "import torch; assert '2.' in torch.__version__, 'wrong version'" \
 echo "  torch: $TORCH_VER OK"
 
 echo "=== [5.1] Pin problematic packages for py3.10 ==="
-# scikit-learn>=1.6, PyWavelets>=1.8, pandas>=2.3 требуют Python 3.11+
-# Создаём constraints файл — блокирует версии даже для транзитивных зависимостей
-# (когда другой пакет тянет scikit-learn как зависимость — pip всё равно возьмёт <1.6)
+# Пакеты которые в новых версиях требуют Python 3.11+:
+#   scikit-learn>=1.6   → py3.11+
+#   PyWavelets>=1.8     → py3.11+
+#   pandas>=2.3         → py3.11+
+#   contourpy>=1.3      → py3.11+ (тянется через matplotlib→filterpy→facexlib)
+#   matplotlib>=3.10    → тянет новый contourpy
+# constraints файл блокирует эти версии даже для транзитивных зависимостей
 cat > /tmp/constraints.txt <<'EOF'
 scikit-learn<1.6
 PyWavelets<1.8
 pandas<2.3
 numpy<2.0
+contourpy<1.3
+matplotlib<3.10
 EOF
 
 pip install \
@@ -156,14 +162,16 @@ pip install \
   "PyWavelets<1.8" \
   "pandas<2.3" \
   "numpy<2.0" \
+  "contourpy<1.3" \
+  "matplotlib<3.10" \
   --quiet \
-  || { tg_error "[5.1] pin packages" "Ошибка пинирования scikit-learn/PyWavelets/pandas/numpy"; exit 1; }
+  || { tg_error "[5.1] pin packages" "Ошибка пинирования пакетов для py3.10"; exit 1; }
 echo "  Pinned packages OK."
 
 echo "=== [5.2] Install SadTalker requirements ==="
-# Фильтруем пинованные пакеты из requirements
-# --constraint гарантирует что даже транзитивные зависимости не выйдут за пины
-grep -iEv '^\s*(torch|torchvision|torchaudio|scikit.learn|sklearn|pywavelets|pandas|numpy)' \
+# Фильтруем из requirements все пакеты которые уже установлены с нужными версиями
+# --constraint гарантирует что транзитивные зависимости тоже не выйдут за пины
+grep -iEv '^\s*(torch|torchvision|torchaudio|scikit.learn|sklearn|pywavelets|pandas|numpy|contourpy|matplotlib)' \
   requirements.txt > /tmp/requirements_notorch.txt
 pip install -r /tmp/requirements_notorch.txt \
   --constraint /tmp/constraints.txt \
