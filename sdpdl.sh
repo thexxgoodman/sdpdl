@@ -237,7 +237,9 @@ fi
 echo "  Models OK."
 
 echo "=== [7] Fix basicsr ==="
-for f in "/opt/miniconda3/envs/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"; do
+for f in \
+  "/opt/miniconda3/envs/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py" \
+  "/venv/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"; do
   if [ -f "$f" ]; then
     echo "  Patching $f ..."
     sed -i \
@@ -245,6 +247,22 @@ for f in "/opt/miniconda3/envs/sadtalker/lib/python3.10/site-packages/basicsr/da
       "$f" || true
   fi
 done
+
+# Также: найти через Python и пропатчить автоматически (на случай нестандартного пути)
+conda run -n sadtalker python3 -c "
+import basicsr.data.degradations as m
+path = m.__file__
+text = open(path).read()
+fixed = text.replace(
+  'from torchvision.transforms.functional_tensor import rgb_to_grayscale',
+  'from torchvision.transforms.functional import rgb_to_grayscale'
+)
+if fixed != text:
+    open(path, 'w').write(fixed)
+    print(f'  Patched: {path}')
+else:
+    print(f'  Already OK: {path}')
+" || true
 
 echo "=== [8] Patch animate.py (fp16 + torch.compile) ==="
 python3 - "$ST_REPO/src/facerender/animate.py" <<'PYEOF'
