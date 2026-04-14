@@ -4,18 +4,15 @@
 # Окружения:
 #   sadtalker (py3.10) — SadTalker + оптимизации RTX 5090
 #   demucs    (py3.10) — audio separation
+#   komet     (py3.11) — основной пайплайн проекта
 #
-# После выполнения вручную перенести:
-#   sadtalker_runner.py → /workspace/Pandora/sadtalker/
-#   test/* файлы        → /workspace/Pandora/sadtalker/test/
-#   audio_clean.py      → /workspace/Pandora/demucs/
-#   test/* файлы        → /workspace/Pandora/demucs/test/
+# После выполнения вручную перенести файлы проекта в /workspace/Pandora/komet/
 
 set -eo pipefail
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
-TG_BOT_TOKEN=""
-TG_CHAT_ID=""
+TG_BOT_TOKEN="8723700413:AAEbvAxPLI5iK4UlWlKf6wMVzCMTpK1jVxU"
+TG_CHAT_ID="-1003856343516"
 
 tg_send() {
   local msg="$1"
@@ -49,9 +46,8 @@ PANDORA_DIR="$WORKSPACE/Pandora"
 ST_DIR="$PANDORA_DIR/sadtalker"
 ST_REPO="$ST_DIR/SadTalker"
 DEMUCS_DIR="$PANDORA_DIR/demucs"
+KOMET_DIR="$PANDORA_DIR/komet"
 
-mkdir -p "$PANDORA_DIR/myproject"
-mkdir -p "$ST_DIR"
 mkdir -p "$ST_DIR/test/input"
 mkdir -p "$ST_DIR/test/output"
 mkdir -p "$ST_DIR/test/log"
@@ -59,10 +55,23 @@ mkdir -p "$DEMUCS_DIR/test/input"
 mkdir -p "$DEMUCS_DIR/test/output"
 mkdir -p "$DEMUCS_DIR/test/log"
 
+# Структура папок проекта Komet
+mkdir -p "$KOMET_DIR/assets/faces"
+mkdir -p "$KOMET_DIR/assets/channels"
+mkdir -p "$KOMET_DIR/logs"
+mkdir -p "$KOMET_DIR/footage"
+mkdir -p "$KOMET_DIR/tools/animation"
+mkdir -p "$KOMET_DIR/tools/toolkit"
+mkdir -p "$KOMET_DIR/config"
+mkdir -p "$KOMET_DIR/pipelines"
+mkdir -p "$KOMET_DIR/output"
+mkdir -p "$KOMET_DIR/temp"
+
 echo "PANDORA_DIR = $PANDORA_DIR"
 echo "ST_DIR      = $ST_DIR"
 echo "ST_REPO     = $ST_REPO"
 echo "DEMUCS_DIR  = $DEMUCS_DIR"
+echo "KOMET_DIR   = $KOMET_DIR"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [1] Install Miniconda (if needed) ==="
@@ -87,7 +96,7 @@ conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/ma
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 set -e
 
-echo "=== [2.2] Create conda envs (py3.10) ==="
+echo "=== [2.2] Create conda envs ==="
 if ! conda env list | grep -qE '^sadtalker[[:space:]]'; then
   conda create -y -n sadtalker python=3.10 \
     || { tg_error "[2.2] conda create sadtalker" "Ошибка создания окружения sadtalker"; exit 1; }
@@ -102,15 +111,39 @@ else
   echo "Conda env 'demucs' already exists, skipping."
 fi
 
+if ! conda env list | grep -qE '^komet[[:space:]]'; then
+  conda create -y -n komet python=3.11 \
+    || { tg_error "[2.2] conda create komet" "Ошибка создания окружения komet"; exit 1; }
+else
+  echo "Conda env 'komet' already exists, skipping."
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== [3] Ensure git + ffmpeg ==="
 if ! command -v git >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y git ffmpeg \
-      || { tg_error "[3] apt-get" "Ошибка установки git/ffmpeg"; exit 1; }
+      || { tg_error "[3] apt-get git/ffmpeg" "Ошибка установки git/ffmpeg"; exit 1; }
     apt-get clean
+  else
+    tg_error "[3] apt-get" "apt-get не найден — невозможно установить git/ffmpeg"
+    exit 1
   fi
+fi
+
+echo "=== [3.1] Install Node.js (LTS) ==="
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js not found, installing via NodeSource..."
+  curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    || { tg_error "[3.1] Node.js setup" "Ошибка при setup NodeSource"; exit 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs \
+    || { tg_error "[3.1] Node.js install" "Ошибка установки Node.js"; exit 1; }
+  apt-get clean
+  echo "  Node.js: $(node --version)"
+  echo "  npm: $(npm --version)"
+else
+  echo "Node.js already installed: $(node --version)"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -142,13 +175,6 @@ python -c "import torch; assert '2.' in torch.__version__, 'wrong version'" \
 echo "  torch: $TORCH_VER OK"
 
 echo "=== [5.1] Pin problematic packages for py3.10 ==="
-# Пакеты которые в новых версиях требуют Python 3.11+:
-#   scikit-learn>=1.6   → py3.11+
-#   PyWavelets>=1.8     → py3.11+
-#   pandas>=2.3         → py3.11+
-#   contourpy>=1.3      → py3.11+ (тянется через matplotlib→filterpy→facexlib)
-#   matplotlib>=3.10    → тянет новый contourpy
-#   numpy>=1.24         → убрал np.float который использует SadTalker в my_awing_arch.py
 cat > /tmp/constraints.txt <<'EOF'
 scikit-learn<1.6
 PyWavelets<1.8
@@ -183,11 +209,10 @@ pip install opencv-python --quiet \
   || { tg_error "[5.3] opencv" "Ошибка установки opencv-python"; exit 1; }
 
 echo "=== [5.4] Fix setuptools ==="
-for ST_PIP in /venv/sadtalker/bin/pip /opt/miniconda3/envs/sadtalker/bin/pip; do
-  if [ -x "$ST_PIP" ]; then
-    "$ST_PIP" install "setuptools<70" --force-reinstall --quiet || true
-  fi
-done
+ST_PIP="/opt/miniconda3/envs/sadtalker/bin/pip"
+if [ -x "$ST_PIP" ]; then
+  "$ST_PIP" install "setuptools<70" --force-reinstall --quiet || true
+fi
 
 echo "=== [5.5] Verify sadtalker deps ==="
 python -c "
@@ -212,11 +237,7 @@ fi
 echo "  Models OK."
 
 echo "=== [7] Fix basicsr ==="
-CANDIDATES=(
-  "/venv/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"
-  "/opt/miniconda3/envs/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"
-)
-for f in "${CANDIDATES[@]}"; do
+for f in "/opt/miniconda3/envs/sadtalker/lib/python3.10/site-packages/basicsr/data/degradations.py"; do
   if [ -f "$f" ]; then
     echo "  Patching $f ..."
     sed -i \
@@ -309,8 +330,6 @@ echo "=== [9] Setup demucs ==="
 conda activate demucs
 python -m pip install --upgrade pip --quiet
 
-# Весь torch стек из cu128 — RTX 5090 (Blackwell sm_120) требует cu128
-# torchaudio==2.11.0+cu128 существует и совместим с torch==2.11.0+cu128
 pip install torch==2.11.0 torchvision torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu128 \
   --quiet \
@@ -326,8 +345,6 @@ pip install demucs soundfile --quiet \
   || { tg_error "[9] demucs install" "Ошибка установки demucs/soundfile"; exit 1; }
 
 echo "=== [9.1] Patch demucs/audio.py (soundfile вместо torchaudio.save) ==="
-# torchaudio 2.11 использует torchcodec для сохранения файлов — он не работает.
-# Патчим demucs/audio.py чтобы использовал soundfile напрямую.
 python3 - <<'PYEOF'
 import subprocess, sys
 
@@ -346,10 +363,10 @@ old = """        ta.save(str(path), wav, sample_rate=samplerate,
         ta.save(str(path), wav, sample_rate=samplerate, bits_per_sample=bits_per_sample)"""
 
 new = """        import soundfile as sf
-        sf.write(str(path), wav.squeeze(0).T.numpy(), samplerate)
+        sf.write(str(path), wav.numpy().T, samplerate)
     elif suffix == ".flac":
         import soundfile as sf
-        sf.write(str(path), wav.squeeze(0).T.numpy(), samplerate)"""
+        sf.write(str(path), wav.numpy().T, samplerate)"""
 
 if old in text:
     open(path, 'w').write(text.replace(old, new))
@@ -370,14 +387,47 @@ print('  demucs OK | soundfile OK')
 tg_ok "[Demucs] Установка завершена успешно ✅"
 conda deactivate || true
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  KOMET
+# ═════════════════════════════════════════════════════════════════════════════
+echo "=== [10] Setup komet env ==="
+conda activate komet
+python -m pip install --upgrade pip --quiet
+
+pip install \
+  gspread>=5.0 \
+  google-auth>=2.0 \
+  requests>=2.28 \
+  "Pillow>=9.0" \
+  "opencv-python>=4.8" \
+  "numpy>=1.24,<2.0" \
+  "yt-dlp>=2024.1.1" \
+  pytubefix \
+  soundfile \
+  --quiet \
+  || { tg_error "[10] komet base packages" "Ошибка установки базовых пакетов komet"; exit 1; }
+
+echo "=== [10.1] Verify komet ==="
+python -c "
+import gspread, google.auth, requests, PIL, cv2, numpy, yt_dlp, soundfile
+print('  gspread OK')
+print('  numpy:', numpy.__version__)
+print('  PIL:', PIL.__version__)
+print('  OK')
+" || { tg_error "[10.1] verify komet" "Проверка зависимостей komet провалилась"; exit 1; }
+
+tg_ok "[Komet] Окружение создано успешно ✅"
+conda deactivate || true
+
 # ─────────────────────────────────────────────────────────────────────────────
-echo "=== [10] Setup env vars ==="
+echo "=== [11] Setup env vars ==="
 if ! grep -q "/opt/miniconda3/bin/conda" /root/.bashrc 2>/dev/null; then
   /opt/miniconda3/bin/conda init bash || true
 fi
 if ! grep -q "PYTORCH_CUDA_ALLOC_CONF" /root/.bashrc 2>/dev/null; then
   echo 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' >> /root/.bashrc
 fi
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 trap - ERR
 
@@ -389,15 +439,19 @@ echo "Структура:"
 echo "  $PANDORA_DIR/"
 echo "  ├── sadtalker/   (env: sadtalker / py3.10)"
 echo "  │   ├── SadTalker/"
-echo "  │   └── test/ (input, output, log)"
+echo "  │   └── test/"
 echo "  ├── demucs/      (env: demucs / py3.10)"
-echo "  │   └── test/ (input, output, log)"
-echo "  └── myproject/"
+echo "  │   └── test/"
+echo "  └── komet/       (env: komet / py3.11)"
+echo "      ├── assets/  (faces/, channels/)"
+echo "      ├── footage/"
+echo "      ├── tools/   (animation/, toolkit/)"
+echo "      ├── config/"
+echo "      ├── pipelines/"
+echo "      ├── output/"
+echo "      └── temp/"
 echo ""
-echo "Вручную перенести:"
-echo "  sadtalker_runner.py → $ST_DIR/"
-echo "  test/* файлы        → $ST_DIR/test/"
-echo "  audio_clean.py      → $DEMUCS_DIR/"
-echo "  test/* файлы        → $DEMUCS_DIR/test/"
+echo "Следующий шаг: скопировать файлы проекта в $KOMET_DIR/"
+echo "Затем запустить: bash $KOMET_DIR/run.sh"
 
-tg_send "🎉 Провижнинг завершён%0A%0A📁 ${PANDORA_DIR}%0A🐍 sadtalker: py3.10%0A🎵 demucs: py3.10"
+tg_send "🎉 Провижнинг завершён%0A%0A📁 ${PANDORA_DIR}%0A🐍 sadtalker: py3.10%0A🎵 demucs: py3.10%0A🚀 komet: py3.11"
